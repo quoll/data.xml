@@ -19,6 +19,12 @@
     (is (= (lazy-parse* xml-input)
            (sexp-as-element sexp-input)))))
 
+(deftest with-namespace
+  (let [xml-input (element :tag {} {:data "http://ex.com/data#"} (element :body {} {}))
+        sexp-input [:tag {} {:data "http://ex.com/data#"} [:body]]]
+    (is (= xml-input
+           (sexp-as-element sexp-input)))))
+
 (deftest as-fragment
   (let [input (list [:tag1 "stuff"]
                     [:tag2 "other"])]
@@ -27,16 +33,16 @@
     (is (thrown? Exception (sexp-as-element input)))))
 
 (deftest with-cdata
-  (let [xml-input (element :tag {:attr "value"}
-                           (element :body {} (cdata "not parsed <stuff")))
+  (let [xml-input (element :tag {:attr "value"} {}
+                           (element :body {} {} (cdata "not parsed <stuff")))
         sexp-input [:tag {:attr "value"} [:body {} [:-cdata "not parsed <stuff"]]]]
     (is (= xml-input
            (sexp-as-element sexp-input)))))
 
 (deftest with-multiple-cdata
   (testing "separate cdata"
-    (let [xml-input (element :tag {:attr "value"}
-                             (element :body {}
+    (let [xml-input (element :tag {:attr "value"} {}
+                             (element :body {} {}
                                       (cdata "not parsed <stuff")
                                       (cdata "more not parsed <stuff")))
           sexp-input [:tag {:attr "value"} [:body {}
@@ -45,8 +51,8 @@
       (is (= xml-input
              (sexp-as-element sexp-input)))))
   (testing "cdata with embedded ]]>"
-    (let [xml-input (element :tag {:attr "value"}
-                             (element :body {}
+    (let [xml-input (element :tag {:attr "value"} {}
+                             (element :body {} {}
                                       (cdata "not parsed <stuff]]")
                                       (cdata ">more not parsed <stuff")))
           sexp-input [:tag {:attr "value"}
@@ -56,8 +62,8 @@
              (emit-str (sexp-as-element sexp-input)))))))
 
 (deftest with-comment
-  (let [xml-input (element :tag {:attr "value"}
-                           (element :body {} (xml-comment "comment <stuff<here<")))
+  (let [xml-input (element :tag {:attr "value"} {}
+                           (element :body {} {} (xml-comment "comment <stuff<here<")))
         sexp-input [:tag {:attr "value"} [:body {} [:-comment "comment <stuff<here<"]]]]
     (is (= xml-input
            (sexp-as-element sexp-input)))))

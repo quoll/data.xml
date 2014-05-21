@@ -19,14 +19,38 @@
 
 ; Represents a parse event.
 ; type is one of :start-element, :end-element, or :characters
-(defrecord Event [type name attrs str])
+(defrecord Event [type name attrs namespaces str])
 
-(defn event [type name & [attrs str]]
-  (Event. type name attrs str))
+(defn event [type name & [attrs namespaces str]]
+  (Event. type name attrs namespaces str))
+
+(def ^:dynamic *current-namespaces*)
+
+(defn- peek-namespace
+  ([prefix default] (or (peek-namespace prefix) default))
+  ([prefix] ((keyword prefix) (first @*current-namespaces*))))
+
+(defn- push-namespace [ns]
+  (swap! *current-namespaces* (fn [[x & _ :as stack] n] (cons (merge x n) stack)) ns))
+
+(defn- pop-namespace []
+  (swap! *current-namespaces* rest))
+
+(defn- lookup-prefix
+  "Looks up a prefix for a namespace URI in the local context, then the namespace stack,
+   with a possible default namespace."
+  ([local-ns prefix] (lookup-prefix local-ns prefix nil))
+  ([local-ns prefix default]
+   (or
+     (if-not (str/blank? prefix)
+       (let [p (keyword prefix)]
+         (get local-ns p (peek-namespace p))))
+     default)))
 
 (defn qualified-name [event-name]
   (if (instance? clojure.lang.Named event-name)
-   [(namespace event-name) (name event-name)]
+    (let [ns (namespace event-name)]
+     [ns (name event-name)])
    (let [name-parts (str/split event-name #"/" 2)]
      (if (= 2 (count name-parts))
        name-parts
@@ -34,19 +58,28 @@
 
 (defn write-attributes [attrs ^javax.xml.stream.XMLStreamWriter writer]
   (doseq [[k v] attrs]
-    (let [[attr-ns attr-name] (qualified-name k)]
+    (let [[attr-ns attr-name _] (qualified-name k)]
       (if attr-ns
-        (.writeAttribute writer attr-ns attr-name (str v))
+        (.writeAttribute writer attr-ns (peek-namespace attr-ns "") attr-name (str v))
         (.writeAttribute writer attr-name (str v))))))
 
 ; Represents a node of an XML tree
-(defrecord Element [tag attrs content])
+(defrecord Element [tag attrs namespaces content])
 (defrecord CData [content])
 (defrecord Comment [content])
 
 (defn emit-start-tag [event ^javax.xml.stream.XMLStreamWriter writer]
-  (let [[nspace qname] (qualified-name (:name event))]
-    (.writeStartElement writer "" qname (or nspace ""))
+  (let [{{default-namespace :. :as namespaces} :namespaces nm :name} event
+        [prefix qname] (qualified-name nm)
+        p (and prefix (keyword prefix))
+        nspace (lookup-prefix namespaces prefix default-namespace)]
+    (.writeStartElement writer (or prefix "") qname (or nspace ""))
+    (when-not (or (str/blank? default-namespace)
+                  (lookup-prefix namespaces prefix))
+      (.writeDefaultNamespace writer default-namespace))
+    (doseq [[pre uri] namespaces :when (not (#{:.} pre))]
+      (.writeNamespace writer (name pre) uri))
+    (push-namespace namespaces)
     (write-attributes (:attrs event) writer)))
 
 (defn str-empty? [s]
@@ -65,7 +98,7 @@
 (defn emit-event [event ^javax.xml.stream.XMLStreamWriter writer]
   (case (:type event)
     :start-element (emit-start-tag event writer)
-    :end-element (.writeEndElement writer)
+    :end-element (do (.writeEndElement writer) (pop-namespace))
     :chars (.writeCharacters writer (:str event))
     :cdata (emit-cdata (:str event) writer)
     :comment (.writeComment writer (:str event))))
@@ -81,10 +114,10 @@
 (extend-protocol EventGeneration
   Element
   (gen-event [element]
-    (Event. :start-element (:tag element) (:attrs element) nil))
+    (Event. :start-element (:tag element) (:attrs element) (:namespaces element) nil))
   (next-events [element next-items]
     (cons (:content element)
-          (cons (Event. :end-element (:tag element) nil nil) next-items)))
+          (cons (Event. :end-element (:tag element) nil nil nil) next-items)))
   Event
   (gen-event [event] event)
   (next-events [_ next-items]
@@ -100,37 +133,37 @@
   
   String
   (gen-event [s]
-    (Event. :chars nil nil s))
+    (Event. :chars nil nil nil s))
   (next-events [_ next-items]
     next-items)
 
   Boolean
   (gen-event [b]
-    (Event. :chars nil nil (str b)))
+    (Event. :chars nil nil nil (str b)))
   (next-events [_ next-items]
     next-items)
 
   Number
   (gen-event [b]
-    (Event. :chars nil nil (str b)))
+    (Event. :chars nil nil nil (str b)))
   (next-events [_ next-items]
     next-items)
 
   CData
   (gen-event [cdata]
-    (Event. :cdata nil nil (:content cdata)))
+    (Event. :cdata nil nil nil (:content cdata)))
   (next-events [_ next-items]
     next-items)
   
   Comment
   (gen-event [comment]
-    (Event. :comment nil nil (:content comment)))
+    (Event. :comment nil nil nil (:content comment)))
   (next-events [_ next-items]
     next-items)
   
   nil
   (gen-event [_]
-    (Event. :chars nil nil ""))
+    (Event. :chars nil nil nil ""))
   (next-events [_ next-items]
     next-items))
 
@@ -141,8 +174,9 @@
        (cons (gen-event e)
              (flatten-elements (next-events e (rest elements))))))))
 
-(defn element [tag & [attrs & content]]
-  (Element. tag (or attrs {}) (remove nil? content)))
+(defn element [tag & [attrs & [n & c :as all-c]]]
+  (let [[namespaces content] (if (map? n) [n c] [{} all-c])]
+    (Element. tag (or attrs {}) namespaces (remove nil? content))))
 
 (defn cdata [content]
   (CData. content))
@@ -195,7 +229,7 @@
    (seq-tree
     (fn [^Event event contents]
       (when (= :start-element (.type event))
-        (Element. (.name event) (.attrs event) contents)))
+        (Element. (.name event) (.attrs event) (.namespaces event) contents)))
     (fn [^Event event] (= :end-element (.type event)))
     (fn [^Event event] (.str event))
     events)))
@@ -203,22 +237,25 @@
 (defprotocol AsElements
   (as-elements [expr] "Return a seq of elements represented by an expression."))
 
-(defn sexp-element [tag attrs child]
+(defn sexp-element [tag attrs namespaces child]
   (cond
    (= :-cdata tag) (CData. (first child))
    (= :-comment tag) (Comment. (first child))
-   :else (Element. tag attrs (mapcat as-elements child))))
+   :else (Element. tag attrs namespaces (mapcat as-elements child))))
+
+(defn- extract-leading-map
+  [[m & remainder :as all]]
+  (if (map? m)
+    [(into {} (for [[k v] m] [k (str v)])) remainder]
+    [{} all]))
 
 (extend-protocol AsElements
   clojure.lang.IPersistentVector
   (as-elements [v]
     (let [[tag & [attrs & after-attrs :as content]] v
-          [attrs content] (if (map? attrs)
-                            [(into {} (for [[k v] attrs]
-                                        [k (str v)]))
-                             after-attrs]
-                            [{} content])]
-      [(sexp-element tag attrs content)]))
+          [attrs content] (extract-leading-map content)
+          [namespaces content] (extract-leading-map content)]
+      [(sexp-element tag attrs namespaces content)]))
 
   clojure.lang.ISeq
   (as-elements [s]
@@ -226,7 +263,7 @@
 
   clojure.lang.Keyword
   (as-elements [k]
-    [(Element. k {} ())])
+    [(Element. k {} {} ())])
 
   java.lang.String
   (as-elements [s]
@@ -276,6 +313,22 @@
       [(keyword (attr-prefix sreader i) (.getAttributeLocalName sreader i))
        (.getAttributeValue sreader i)])))
 
+(defn- add-default-namespace [^XMLStreamReader sreader namespaces]
+  (let [n (.getNamespaceURI sreader)]
+    (if (str/blank? n)
+      namespaces
+      (assoc namespaces :. n)))) 
+
+(defn- namespaces [^XMLStreamReader sreader]
+  (add-default-namespace sreader
+    (into {}
+          (for [i (range (.getNamespaceCount sreader))]
+            [(keyword (.getNamespacePrefix sreader i)) (.getNamespaceURI sreader i)]))))
+
+(defn- element-keyword [^XMLStreamReader sreader]
+  (let [prefix (.getPrefix sreader)]
+    (keyword (when-not (str/blank? prefix) prefix) (.getLocalName sreader))))
+
 ; Note, sreader is mutable and mutated here in pull-seq, but it's
 ; protected by a lazy-seq so it's thread-safe.
 (defn- pull-seq
@@ -287,17 +340,19 @@
      (condp == (.next sreader)
        XMLStreamConstants/START_ELEMENT
        (cons (event :start-element
-                    (keyword (.getLocalName sreader))
-                    (attr-hash sreader) nil)
+                    (element-keyword sreader)
+                    (attr-hash sreader)
+                    (namespaces sreader)
+                    nil)
              (pull-seq sreader)) 
        XMLStreamConstants/END_ELEMENT
        (cons (event :end-element
-                    (keyword (.getLocalName sreader)) nil nil)
+                    (element-keyword sreader) nil nil nil)
              (pull-seq sreader))
        XMLStreamConstants/CHARACTERS
        (if-let [text (and (not (.isWhiteSpace sreader))
                           (.getText sreader))]
-         (cons (event :characters nil nil text)
+         (cons (event :characters nil nil nil text)
                (pull-seq sreader))
          (recur))
        XMLStreamConstants/END_DOCUMENT
@@ -375,8 +430,9 @@
       (check-stream-encoding stream (or (:encoding opts) "UTF-8")))
     
     (.writeStartDocument writer (or (:encoding opts) "UTF-8") "1.0")
-    (doseq [event (flatten-elements [e])]
-      (emit-event event writer))
+    (binding [*current-namespaces* (atom (list {}))]
+      (doseq [event (flatten-elements [e])]
+        (emit-event event writer)))
     (.writeEndDocument writer)
     stream))
 
