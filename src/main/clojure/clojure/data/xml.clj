@@ -28,13 +28,14 @@
 
 (defn- peek-namespace
   ([prefix default] (or (peek-namespace prefix) default))
-  ([prefix] ((keyword prefix) (first @*current-namespaces*))))
+  ([prefix] ((keyword prefix) (first *current-namespaces*))))
 
 (defn- push-namespace [ns]
-  (swap! *current-namespaces* (fn [[x & _ :as stack] n] (cons (merge x n) stack)) ns))
+  (var-set #'*current-namespaces* (let [[x & _ :as stack] *current-namespaces*]
+                                  (cons (merge x ns) stack))))
 
 (defn- pop-namespace []
-  (swap! *current-namespaces* rest))
+  (var-set #'*current-namespaces* (rest *current-namespaces*)))
 
 (defn- lookup-prefix
   "Looks up a prefix for a namespace URI in the local context, then the namespace stack,
@@ -430,7 +431,7 @@
       (check-stream-encoding stream (or (:encoding opts) "UTF-8")))
     
     (.writeStartDocument writer (or (:encoding opts) "UTF-8") "1.0")
-    (binding [*current-namespaces* (atom (list {}))]
+    (binding [*current-namespaces* (list {})]
       (doseq [event (flatten-elements [e])]
         (emit-event event writer)))
     (.writeEndDocument writer)
