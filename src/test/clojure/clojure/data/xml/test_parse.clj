@@ -98,14 +98,14 @@
                                    {}
                                    "1")
                           (element :data/foo {} {} "foo")
-                          (element :data/subdata {} {:. "http://foo.com/"
+                          (element :data/subdata {} {:xmlns "http://foo.com/"
                                                      :data "http://example.com/more/"}
                                   (element :data/bar {} {} "bar")
                                   (element :yyy {} {} "yyy")))
         parsed (parse-str input)]
     (is (= expected parsed))
     (let [yyy (-> parsed :content (nth 2) :content (nth 1))]
-      (is (= {:. "http://foo.com/"
+      (is (= {:xmlns "http://foo.com/"
               :data "http://example.com/more/"
               :rdf "http://www.w3.org/1999/02/22-rdf-syntax-ns#"}
              (meta yyy))))
