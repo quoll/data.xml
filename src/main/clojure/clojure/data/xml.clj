@@ -28,14 +28,15 @@
 
 (defn- peek-namespace
   ([prefix default] (or (peek-namespace prefix) default))
-  ([prefix] ((keyword prefix) (first *current-namespaces*))))
+  ([prefix] ((keyword prefix) (first @*current-namespaces*)))
+  ([] (first @*current-namespaces*)))
 
 (defn- push-namespace [ns]
-  (var-set #'*current-namespaces* (let [[x & _ :as stack] *current-namespaces*]
-                                  (cons (merge x ns) stack))))
+  (swap! *current-namespaces* (fn [[x & _ :as stack] n]
+                                  (cons (merge x n) stack)) ns))
 
 (defn- pop-namespace []
-  (var-set #'*current-namespaces* (rest *current-namespaces*)))
+  (swap! *current-namespaces* rest))
 
 (defn- lookup-prefix
   "Looks up a prefix for a namespace URI in the local context, then the namespace stack,
@@ -230,7 +231,8 @@
    (seq-tree
     (fn [^Event event contents]
       (when (= :start-element (.type event))
-        (Element. (.name event) (.attrs event) (.namespaces event) contents)))
+        (let [m (meta event)]
+          (with-meta (Element. (.name event) (.attrs event) (.namespaces event) contents) m))))
     (fn [^Event event] (= :end-element (.type event)))
     (fn [^Event event] (.str event))
     events)))
@@ -314,17 +316,17 @@
       [(keyword (attr-prefix sreader i) (.getAttributeLocalName sreader i))
        (.getAttributeValue sreader i)])))
 
-(defn- add-default-namespace [^XMLStreamReader sreader namespaces]
-  (let [n (.getNamespaceURI sreader)]
-    (if (str/blank? n)
-      namespaces
-      (assoc namespaces :. n)))) 
-
 (defn- namespaces [^XMLStreamReader sreader]
-  (add-default-namespace sreader
-    (into {}
-          (for [i (range (.getNamespaceCount sreader))]
-            [(keyword (.getNamespacePrefix sreader i)) (.getNamespaceURI sreader i)]))))
+  (into {}
+        (keep
+          (fn [i]
+            (let [prefix (.getNamespacePrefix sreader i)
+                  uri (.getNamespaceURI sreader i)]
+              (if prefix
+                [(keyword prefix) uri]
+                (if (not= uri (peek-namespace :.))
+                  [:. uri]))))
+          (range (.getNamespaceCount sreader)))))
 
 (defn- element-keyword [^XMLStreamReader sreader]
   (let [prefix (.getPrefix sreader)]
@@ -335,31 +337,37 @@
 (defn- pull-seq
   "Creates a seq of events.  The XMLStreamConstants/SPACE clause below doesn't seem to 
    be triggered by the JDK StAX parser, but is by others.  Leaving in to be more complete."
-  [^XMLStreamReader sreader]
-  (lazy-seq
-   (loop []
-     (condp == (.next sreader)
-       XMLStreamConstants/START_ELEMENT
-       (cons (event :start-element
-                    (element-keyword sreader)
-                    (attr-hash sreader)
-                    (namespaces sreader)
-                    nil)
-             (pull-seq sreader)) 
-       XMLStreamConstants/END_ELEMENT
-       (cons (event :end-element
-                    (element-keyword sreader) nil nil nil)
-             (pull-seq sreader))
-       XMLStreamConstants/CHARACTERS
-       (if-let [text (and (not (.isWhiteSpace sreader))
-                          (.getText sreader))]
-         (cons (event :characters nil nil nil text)
-               (pull-seq sreader))
-         (recur))
-       XMLStreamConstants/END_DOCUMENT
-       nil
-       (recur);; Consume and ignore comments, spaces, processing instructions etc
-       ))))
+  [^XMLStreamReader sreader bnd-fn]
+  (lazy-seq (bnd-fn sreader bnd-fn)))
+
+(defn- seq-step
+  "The real implementation of pull-seq, with bindings set for access to the namespace stack."
+  [^XMLStreamReader sreader bnd-fn]
+  (loop []
+    (condp == (.next sreader)
+      XMLStreamConstants/START_ELEMENT
+      (let [element-ns (namespaces sreader)
+            ev (event :start-element
+                      (element-keyword sreader)
+                      (attr-hash sreader)
+                      element-ns
+                      nil)]
+        (push-namespace element-ns)
+        (cons (with-meta ev (peek-namespace)) (pull-seq sreader bnd-fn)))
+      XMLStreamConstants/END_ELEMENT
+      (cons (event :end-element
+                   (element-keyword sreader) nil nil nil)
+            (pull-seq sreader bnd-fn))
+      XMLStreamConstants/CHARACTERS
+      (if-let [text (and (not (.isWhiteSpace sreader))
+                         (.getText sreader))]
+        (cons (event :characters nil nil nil text)
+              (pull-seq sreader bnd-fn))
+        (recur))
+      XMLStreamConstants/END_DOCUMENT
+      nil
+      (recur);; Consume and ignore comments, spaces, processing instructions etc
+      )))
 
 (def ^{:private true} xml-input-factory-props
   {:allocator javax.xml.stream.XMLInputFactory/ALLOCATOR
@@ -391,7 +399,9 @@
         ;; InputStream or Reader, and there are different
         ;; createXMLStreamReader signatures for each of those types.
         sreader (.createXMLStreamReader fac s)]
-    (pull-seq sreader)))
+    (binding [*current-namespaces* (atom (list {}))]
+      (let [bnd-fn (bound-fn [sr bfn] (seq-step sr bfn))]
+        (pull-seq sreader bnd-fn)))))
 
 (defn parse
   "Parses the source, which can be an
@@ -431,7 +441,7 @@
       (check-stream-encoding stream (or (:encoding opts) "UTF-8")))
     
     (.writeStartDocument writer (or (:encoding opts) "UTF-8") "1.0")
-    (binding [*current-namespaces* (list {})]
+    (binding [*current-namespaces* (atom (list {}))]
       (doseq [event (flatten-elements [e])]
         (emit-event event writer)))
     (.writeEndDocument writer)

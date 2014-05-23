@@ -84,14 +84,28 @@
                         xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">
                  <rdf:value rdf:datatype=\"http://www.w3.org/2001/XMLSchema#integer\">1</rdf:value>
                  <data:foo>foo</data:foo>
+                 <data:subdata xmlns=\"http://foo.com/\"
+                               xmlns:data=\"http://example.com/more/\">
+                   <data:bar>bar</data:bar>
+                   <yyy>yyy</yyy>
+                 </data:subdata>
                </rdf:RDF>"
         expected (element :rdf/RDF {}
-                          {:. "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
-                           :data "http://ex.com/data#"
+                          {:data "http://ex.com/data#"
                            :rdf "http://www.w3.org/1999/02/22-rdf-syntax-ns#"}
                           (element :rdf/value
                                    {:rdf/datatype "http://www.w3.org/2001/XMLSchema#integer"}
-                                   {:. "http://www.w3.org/1999/02/22-rdf-syntax-ns#"}
+                                   {}
                                    "1")
-                          (element :data/foo {} {:. "http://ex.com/data#"} "foo"))]
-    (is (= expected (parse-str input))))) 
+                          (element :data/foo {} {} "foo")
+                          (element :data/subdata {} {:. "http://foo.com/"
+                                                     :data "http://example.com/more/"}
+                                  (element :data/bar {} {} "bar")
+                                  (element :yyy {} {} "yyy")))
+        parsed (parse-str input)]
+    (is (= expected parsed))
+    (let [yyy (nth (:content (nth (:content parsed) 2)) 1)]
+      (is (= {:. "http://foo.com/"
+              :data "http://example.com/more/"
+              :rdf "http://www.w3.org/1999/02/22-rdf-syntax-ns#"}
+             (meta yyy))))))
