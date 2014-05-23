@@ -26,6 +26,9 @@
 
 (def ^:dynamic *current-namespaces*)
 
+(defn- clean-namespace [ns]
+  (into {} (remove (fn [[k v]] (str/blank? v)) ns)))
+
 (defn- peek-namespace
   ([prefix default] (or (peek-namespace prefix) default))
   ([prefix] ((keyword prefix) (first @*current-namespaces*)))
@@ -33,9 +36,7 @@
 
 (defn- push-namespace [ns]
   (swap! *current-namespaces* (fn [[x & _ :as stack] n]
-                                (let [new-ns (into {} (remove
-                                                        (fn [[k v]] (str/blank? v))
-                                                        (merge x n)))]
+                                (let [new-ns (clean-namespace (merge x n))]
                                   (cons new-ns stack))) ns))
 
 (defn- pop-namespace []
@@ -353,14 +354,16 @@
             ev (event :start-element
                       (element-keyword sreader)
                       (attr-hash sreader)
-                      element-ns
+                      (clean-namespace element-ns)
                       nil)]
         (push-namespace element-ns)
         (cons (with-meta ev (peek-namespace)) (pull-seq sreader bnd-fn)))
       XMLStreamConstants/END_ELEMENT
-      (cons (event :end-element
-                   (element-keyword sreader) nil nil nil)
-            (pull-seq sreader bnd-fn))
+      (do
+        (pop-namespace)
+        (cons (event :end-element
+                     (element-keyword sreader) nil nil nil)
+              (pull-seq sreader bnd-fn)))
       XMLStreamConstants/CHARACTERS
       (if-let [text (and (not (.isWhiteSpace sreader))
                          (.getText sreader))]
