@@ -33,7 +33,10 @@
 
 (defn- push-namespace [ns]
   (swap! *current-namespaces* (fn [[x & _ :as stack] n]
-                                  (cons (merge x n) stack)) ns))
+                                (let [new-ns (into {} (remove
+                                                        (fn [[k v]] (str/blank? v))
+                                                        (merge x n)))]
+                                  (cons new-ns stack))) ns))
 
 (defn- pop-namespace []
   (swap! *current-namespaces* rest))
