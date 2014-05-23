@@ -75,7 +75,7 @@
 (defrecord Comment [content])
 
 (defn emit-start-tag [event ^javax.xml.stream.XMLStreamWriter writer]
-  (let [{{default-namespace :. :as namespaces} :namespaces nm :name} event
+  (let [{{default-namespace :xmlns :as namespaces} :namespaces nm :name} event
         [prefix qname] (qualified-name nm)
         p (and prefix (keyword prefix))
         nspace (lookup-prefix namespaces prefix default-namespace)]
@@ -83,7 +83,7 @@
     (when-not (or (str/blank? default-namespace)
                   (lookup-prefix namespaces prefix))
       (.writeDefaultNamespace writer default-namespace))
-    (doseq [[pre uri] namespaces :when (not (#{:.} pre))]
+    (doseq [[pre uri] namespaces :when (not (#{:xmlns} pre))]
       (.writeNamespace writer (name pre) uri))
     (push-namespace namespaces)
     (write-attributes (:attrs event) writer)))
@@ -328,8 +328,8 @@
                   uri (.getNamespaceURI sreader i)]
               (if prefix
                 [(keyword prefix) uri]
-                (if (not= uri (peek-namespace :.))
-                  [:. uri]))))
+                (if (not= uri (peek-namespace :xmlns))
+                  [:xmlns uri]))))
           (range (.getNamespaceCount sreader)))))
 
 (defn- element-keyword [^XMLStreamReader sreader]
