@@ -24,33 +24,31 @@
 (defn event [type name & [attrs namespaces str]]
   (Event. type name attrs namespaces str))
 
-(def ^:dynamic *current-namespaces*)
+(def empty-stack [{}])
 
 (defn- clean-namespace [ns]
   (into {} (remove (fn [[k v]] (str/blank? v)) ns)))
 
 (defn- peek-namespace
-  ([prefix default] (or (peek-namespace prefix) default))
-  ([prefix] ((keyword prefix) (first @*current-namespaces*)))
-  ([] (first @*current-namespaces*)))
+  ([stack prefix default] (or (peek-namespace stack prefix) default))
+  ([stack prefix] ((keyword prefix) (first stack)))
+  ([stack] (first stack)))
 
-(defn- push-namespace [ns]
-  (swap! *current-namespaces* (fn [[x & _ :as stack] n]
-                                (let [new-ns (clean-namespace (merge x n))]
-                                  (cons new-ns stack))) ns))
+(defn- push-namespace [[x & _ :as stack] ns]
+  (cons (clean-namespace (merge x ns)) stack))
 
-(defn- pop-namespace []
-  (swap! *current-namespaces* rest))
+(defn- pop-namespace [stack]
+  (rest stack))
 
 (defn- lookup-prefix
   "Looks up a prefix for a namespace URI in the local context, then the namespace stack,
    with a possible default namespace."
-  ([local-ns prefix] (lookup-prefix local-ns prefix nil))
-  ([local-ns prefix default]
+  ([stack local-ns prefix] (lookup-prefix stack local-ns prefix nil))
+  ([stack local-ns prefix default]
    (or
      (if-not (str/blank? prefix)
        (let [p (keyword prefix)]
-         (get local-ns p (peek-namespace p))))
+         (get local-ns p (peek-namespace stack p))))
      default)))
 
 (defn qualified-name [event-name]
@@ -62,11 +60,11 @@
        name-parts
        [nil (first name-parts)]))))
 
-(defn write-attributes [attrs ^javax.xml.stream.XMLStreamWriter writer]
+(defn write-attributes [attrs ^javax.xml.stream.XMLStreamWriter writer stack]
   (doseq [[k v] attrs]
     (let [[attr-ns attr-name _] (qualified-name k)]
       (if attr-ns
-        (.writeAttribute writer attr-ns (peek-namespace attr-ns "") attr-name (str v))
+        (.writeAttribute writer attr-ns (peek-namespace stack attr-ns "") attr-name (str v))
         (.writeAttribute writer attr-name (str v))))))
 
 ; Represents a node of an XML tree
@@ -74,19 +72,20 @@
 (defrecord CData [content])
 (defrecord Comment [content])
 
-(defn emit-start-tag [event ^javax.xml.stream.XMLStreamWriter writer]
+(defn emit-start-tag [event ^javax.xml.stream.XMLStreamWriter writer stack]
   (let [{{default-namespace :xmlns :as namespaces} :namespaces nm :name} event
         [prefix qname] (qualified-name nm)
         p (and prefix (keyword prefix))
-        nspace (lookup-prefix namespaces prefix default-namespace)]
+        nspace (lookup-prefix stack namespaces prefix default-namespace)]
     (.writeStartElement writer (or prefix "") qname (or nspace ""))
     (when-not (or (str/blank? default-namespace)
-                  (lookup-prefix namespaces prefix))
+                  (lookup-prefix stack namespaces prefix))
       (.writeDefaultNamespace writer default-namespace))
     (doseq [[pre uri] namespaces :when (not (#{:xmlns} pre))]
       (.writeNamespace writer (name pre) uri))
-    (push-namespace namespaces)
-    (write-attributes (:attrs event) writer)))
+    (let [new-stack (push-namespace stack namespaces)]
+      (write-attributes (:attrs event) writer new-stack)
+      new-stack)))
 
 (defn str-empty? [s]
   (or (nil? s)
@@ -101,13 +100,13 @@
           (.writeCData writer (subs cdata-str 0 (+ idx 2)))
           (recur (subs cdata-str (+ idx 2)) writer))))))
 
-(defn emit-event [event ^javax.xml.stream.XMLStreamWriter writer]
+(defn emit-event [event ^javax.xml.stream.XMLStreamWriter writer stack]
   (case (:type event)
-    :start-element (emit-start-tag event writer)
-    :end-element (do (.writeEndElement writer) (pop-namespace))
-    :chars (.writeCharacters writer (:str event))
-    :cdata (emit-cdata (:str event) writer)
-    :comment (.writeComment writer (:str event))))
+    :start-element (emit-start-tag event writer stack)
+    :end-element (do (.writeEndElement writer) (pop-namespace stack))
+    :chars (do (.writeCharacters writer (:str event)) stack)
+    :cdata (do (emit-cdata (:str event) writer) stack)
+    :comment (do (.writeComment writer (:str event)) stack)))
 
 (defprotocol EventGeneration
   "Protocol for generating new events based on element type"
@@ -320,7 +319,7 @@
       [(keyword (attr-prefix sreader i) (.getAttributeLocalName sreader i))
        (.getAttributeValue sreader i)])))
 
-(defn- namespaces [^XMLStreamReader sreader]
+(defn- namespaces [^XMLStreamReader sreader stack]
   (into {}
         (keep
           (fn [i]
@@ -328,7 +327,7 @@
                   uri (.getNamespaceURI sreader i)]
               (if prefix
                 [(keyword prefix) uri]
-                (if (not= uri (peek-namespace :xmlns))
+                (if (not= uri (peek-namespace stack :xmlns))
                   [:xmlns uri]))))
           (range (.getNamespaceCount sreader)))))
 
@@ -341,39 +340,39 @@
 (defn- pull-seq
   "Creates a seq of events.  The XMLStreamConstants/SPACE clause below doesn't seem to 
    be triggered by the JDK StAX parser, but is by others.  Leaving in to be more complete."
-  [^XMLStreamReader sreader bnd-fn]
-  (lazy-seq (bnd-fn sreader bnd-fn)))
-
-(defn- seq-step
-  "The real implementation of pull-seq, with bindings set for access to the namespace stack."
-  [^XMLStreamReader sreader bnd-fn]
-  (loop []
-    (condp == (.next sreader)
-      XMLStreamConstants/START_ELEMENT
-      (let [element-ns (namespaces sreader)
-            ev (event :start-element
-                      (element-keyword sreader)
-                      (attr-hash sreader)
-                      (clean-namespace element-ns)
-                      nil)]
-        (push-namespace element-ns)
-        (cons (with-meta ev (peek-namespace)) (pull-seq sreader bnd-fn)))
-      XMLStreamConstants/END_ELEMENT
-      (do
-        (pop-namespace)
-        (cons (event :end-element
-                     (element-keyword sreader) nil nil nil)
-              (pull-seq sreader bnd-fn)))
-      XMLStreamConstants/CHARACTERS
-      (if-let [text (and (not (.isWhiteSpace sreader))
-                         (.getText sreader))]
-        (cons (event :characters nil nil nil text)
-              (pull-seq sreader bnd-fn))
-        (recur))
-      XMLStreamConstants/END_DOCUMENT
-      nil
-      (recur);; Consume and ignore comments, spaces, processing instructions etc
-      )))
+  [^XMLStreamReader sreader stack]
+  (lazy-seq
+    (loop []
+      (condp == (.next sreader)
+        XMLStreamConstants/START_ELEMENT
+        (let [element-ns (namespaces sreader stack)
+              ev (event :start-element
+                        (element-keyword sreader)
+                        (attr-hash sreader)
+                        (clean-namespace element-ns)
+                        nil)
+              loaded-stack (push-namespace stack element-ns)
+              current-namespaces (peek-namespace loaded-stack)
+              [remaining final-stack] (pull-seq sreader loaded-stack)]
+          [(cons (with-meta ev current-namespaces) remaining) final-stack])
+        XMLStreamConstants/END_ELEMENT
+        (let [unwound-stack (pop-namespace stack)
+              element-name (element-keyword sreader)
+              [remaining final-stack] (pull-seq sreader unwound-stack)]
+          [(cons (event :end-element element-name nil nil nil)
+                 remaining)
+           final-stack])
+        XMLStreamConstants/CHARACTERS
+        (if-let [text (and (not (.isWhiteSpace sreader))
+                           (.getText sreader))]
+          (let [[remaining final-stack] (pull-seq sreader stack)]
+            [(cons (event :characters nil nil nil text) remaining)
+             final-stack])
+          (recur))
+        XMLStreamConstants/END_DOCUMENT
+        nil
+        (recur);; Consume and ignore comments, spaces, processing instructions etc
+        ))))
 
 (def ^{:private true} xml-input-factory-props
   {:allocator javax.xml.stream.XMLInputFactory/ALLOCATOR
@@ -405,9 +404,7 @@
         ;; InputStream or Reader, and there are different
         ;; createXMLStreamReader signatures for each of those types.
         sreader (.createXMLStreamReader fac s)]
-    (binding [*current-namespaces* (atom (list {}))]
-      (let [bnd-fn (bound-fn [sr bfn] (seq-step sr bfn))]
-        (pull-seq sreader bnd-fn)))))
+    (first (pull-seq sreader empty-stack))))
 
 (defn parse
   "Parses the source, which can be an
@@ -447,9 +444,9 @@
       (check-stream-encoding stream (or (:encoding opts) "UTF-8")))
     
     (.writeStartDocument writer (or (:encoding opts) "UTF-8") "1.0")
-    (binding [*current-namespaces* (atom (list {}))]
-      (doseq [event (flatten-elements [e])]
-        (emit-event event writer)))
+    (loop [[event & remaining] (flatten-elements [e]) stack empty-stack]
+      (when event
+        (recur remaining (emit-event event writer stack))))
     (.writeEndDocument writer)
     stream))
 
