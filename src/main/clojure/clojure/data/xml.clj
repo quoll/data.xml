@@ -10,174 +10,20 @@
   emit these as text."
   :author "Chris Houser"}
   clojure.data.xml
-  (:require [clojure.string :as str])
-  (:import (javax.xml.stream XMLInputFactory
-                             XMLStreamReader
-                             XMLStreamConstants)
-           (java.nio.charset Charset)
-           (java.io Reader)))
+  (:require [clojure.string :as str]
+            [clojure.data.xml.parse :as parse]
+            [clojure.data.xml.emit :as emit]
+            [clojure.data.xml.namespaces :as ns]
+            [clojure.data.xml.syntax :as syntax])
+  (:import [java.nio.charset Charset]
+           [java.io StringReader]
+           [clojure.data.xml.event Event]
+           [clojure.data.xml.node Element CData Comment]))
 
-; Represents a parse event.
-; type is one of :start-element, :end-element, or :characters
-(defrecord Event [type name attrs namespaces str])
 
-(defn event [type name & [attrs namespaces str]]
-  (Event. type name attrs namespaces str))
-
-(def empty-stack [{}])
-
-(defn- clean-namespace [ns]
-  (into {} (remove (fn [[k v]] (str/blank? v)) ns)))
-
-(defn- peek-namespace
-  ([stack prefix default] (or (peek-namespace stack prefix) default))
-  ([stack prefix] ((keyword prefix) (first stack)))
-  ([stack] (first stack)))
-
-(defn- push-namespace [[x & _ :as stack] ns]
-  (cons (clean-namespace (merge x ns)) stack))
-
-(defn- pop-namespace [stack]
-  (rest stack))
-
-(defn- lookup-prefix
-  "Looks up a prefix for a namespace URI in the local context, then the namespace stack,
-   with a possible default namespace."
-  ([stack local-ns prefix] (lookup-prefix stack local-ns prefix nil))
-  ([stack local-ns prefix default]
-   (or
-     (if-not (str/blank? prefix)
-       (let [p (keyword prefix)]
-         (get local-ns p (peek-namespace stack p))))
-     default)))
-
-(defn qualified-name [event-name]
-  (if (instance? clojure.lang.Named event-name)
-    (let [ns (namespace event-name)]
-     [ns (name event-name)])
-   (let [name-parts (str/split event-name #"/" 2)]
-     (if (= 2 (count name-parts))
-       name-parts
-       [nil (first name-parts)]))))
-
-(defn write-attributes [attrs ^javax.xml.stream.XMLStreamWriter writer stack]
-  (doseq [[k v] attrs]
-    (let [[attr-ns attr-name _] (qualified-name k)]
-      (if attr-ns
-        (.writeAttribute writer attr-ns (peek-namespace stack attr-ns "") attr-name (str v))
-        (.writeAttribute writer attr-name (str v))))))
-
-; Represents a node of an XML tree
-(defrecord Element [tag attrs namespaces content])
-(defrecord CData [content])
-(defrecord Comment [content])
-
-(defn emit-start-tag [event ^javax.xml.stream.XMLStreamWriter writer stack]
-  (let [{{default-namespace :xmlns :as namespaces} :namespaces nm :name} event
-        [prefix qname] (qualified-name nm)
-        p (and prefix (keyword prefix))
-        nspace (lookup-prefix stack namespaces prefix default-namespace)]
-    (.writeStartElement writer (or prefix "") qname (or nspace ""))
-    (when-not (or (str/blank? default-namespace)
-                  (lookup-prefix stack namespaces prefix))
-      (.writeDefaultNamespace writer default-namespace))
-    (doseq [[pre uri] namespaces :when (not (#{:xmlns} pre))]
-      (.writeNamespace writer (name pre) uri))
-    (let [new-stack (push-namespace stack namespaces)]
-      (write-attributes (:attrs event) writer new-stack)
-      new-stack)))
-
-(defn str-empty? [s]
-  (or (nil? s)
-      (= s "")))
-
-(defn emit-cdata [^String cdata-str ^javax.xml.stream.XMLStreamWriter writer]
-  (when-not (str-empty? cdata-str) 
-    (let [idx (.indexOf cdata-str "]]>")]
-      (if (= idx -1)
-        (.writeCData writer cdata-str )
-        (do
-          (.writeCData writer (subs cdata-str 0 (+ idx 2)))
-          (recur (subs cdata-str (+ idx 2)) writer))))))
-
-(defn emit-event [event ^javax.xml.stream.XMLStreamWriter writer stack]
-  (case (:type event)
-    :start-element (emit-start-tag event writer stack)
-    :end-element (do (.writeEndElement writer) (pop-namespace stack))
-    :chars (do (.writeCharacters writer (:str event)) stack)
-    :cdata (do (emit-cdata (:str event) writer) stack)
-    :comment (do (.writeComment writer (:str event)) stack)))
-
-(defprotocol EventGeneration
-  "Protocol for generating new events based on element type"
-  (gen-event [item]
-    "Function to generate an event for e.")
-  (next-events [item next-items]
-    "Returns the next set of events that should occur after e.  next-events are the
-     events that should be generated after this one is complete."))
-
-(extend-protocol EventGeneration
-  Element
-  (gen-event [element]
-    (Event. :start-element (:tag element) (:attrs element) (:namespaces element) nil))
-  (next-events [element next-items]
-    (cons (:content element)
-          (cons (Event. :end-element (:tag element) nil nil nil) next-items)))
-  Event
-  (gen-event [event] event)
-  (next-events [_ next-items]
-    next-items)
-
-  clojure.lang.Sequential
-  (gen-event [coll]
-    (gen-event (first coll)))
-  (next-events [coll next-items]
-    (if-let [r (seq (rest coll))]
-      (cons (next-events (first coll) r) next-items)
-      (next-events (first coll) next-items)))
-  
-  String
-  (gen-event [s]
-    (Event. :chars nil nil nil s))
-  (next-events [_ next-items]
-    next-items)
-
-  Boolean
-  (gen-event [b]
-    (Event. :chars nil nil nil (str b)))
-  (next-events [_ next-items]
-    next-items)
-
-  Number
-  (gen-event [b]
-    (Event. :chars nil nil nil (str b)))
-  (next-events [_ next-items]
-    next-items)
-
-  CData
-  (gen-event [cdata]
-    (Event. :cdata nil nil nil (:content cdata)))
-  (next-events [_ next-items]
-    next-items)
-  
-  Comment
-  (gen-event [comment]
-    (Event. :comment nil nil nil (:content comment)))
-  (next-events [_ next-items]
-    next-items)
-  
-  nil
-  (gen-event [_]
-    (Event. :chars nil nil nil ""))
-  (next-events [_ next-items]
-    next-items))
-
-(defn flatten-elements [elements]
-  (when (seq elements)
-    (lazy-seq
-     (let [e (first elements)]
-       (cons (gen-event e)
-             (flatten-elements (next-events e (rest elements))))))))
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;; SEXP structures
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (defn element [tag & [attrs & [n & c :as all-c]]]
   (let [[namespaces content] (if (map? n) [n c] [{} all-c])]
@@ -188,99 +34,6 @@
 
 (defn xml-comment [content]
   (Comment. content))
-
-;=== Parse-related functions ===
-(defn seq-tree
-  "Takes a seq of events that logically represents
-  a tree by each event being one of: enter-sub-tree event,
-  exit-sub-tree event, or node event.
-
-  Returns a lazy sequence whose first element is a sequence of
-  sub-trees and whose remaining elements are events that are not
-  siblings or descendants of the initial event.
-
-  The given exit? function must return true for any exit-sub-tree
-  event.  parent must be a function of two arguments: the first is an
-  event, the second a sequence of nodes or subtrees that are children
-  of the event.  parent must return nil or false if the event is not
-  an enter-sub-tree event.  Any other return value will become
-  a sub-tree of the output tree and should normally contain in some
-  way the children passed as the second arg.  The node function is
-  called with a single event arg on every event that is neither parent
-  nor exit, and its return value will become a node of the output tree.
-
-  (seq-tree #(when (= %1 :<) (vector %2)) #{:>} str
-            [1 2 :< 3 :< 4 :> :> 5 :> 6])
-  ;=> ((\"1\" \"2\" [(\"3\" [(\"4\")])] \"5\") 6)"
- [parent exit? node coll]
-  (lazy-seq
-    (when-let [[event] (seq coll)]
-      (let [more (rest coll)]
-        (if (exit? event)
-          (cons nil more)
-          (let [tree (seq-tree parent exit? node more)]
-            (if-let [p (parent event (lazy-seq (first tree)))]
-              (let [subtree (seq-tree parent exit? node (lazy-seq (rest tree)))]
-                (cons (cons p (lazy-seq (first subtree)))
-                      (lazy-seq (rest subtree))))
-              (cons (cons (node event) (lazy-seq (first tree)))
-                    (lazy-seq (rest tree))))))))))
-
-(defn event-tree
-  "Returns a lazy tree of Element objects for the given seq of Event
-  objects. See source-seq and parse."
-  [events]
-  (ffirst
-   (seq-tree
-    (fn [^Event event contents]
-      (when (= :start-element (.type event))
-        (let [m (meta event)]
-          (with-meta (Element. (.name event) (.attrs event) (.namespaces event) contents) m))))
-    (fn [^Event event] (= :end-element (.type event)))
-    (fn [^Event event] (.str event))
-    events)))
-
-(defprotocol AsElements
-  (as-elements [expr] "Return a seq of elements represented by an expression."))
-
-(defn sexp-element [tag attrs namespaces child]
-  (cond
-   (= :-cdata tag) (CData. (first child))
-   (= :-comment tag) (Comment. (first child))
-   :else (Element. tag attrs namespaces (mapcat as-elements child))))
-
-(defn- extract-leading-map
-  [[m & remainder :as all]]
-  (if (map? m)
-    [(into {} (for [[k v] m] [k (str v)])) remainder]
-    [{} all]))
-
-(extend-protocol AsElements
-  clojure.lang.IPersistentVector
-  (as-elements [v]
-    (let [[tag & [attrs & after-attrs :as content]] v
-          [attrs content] (extract-leading-map content)
-          [namespaces content] (extract-leading-map content)]
-      [(sexp-element tag attrs namespaces content)]))
-
-  clojure.lang.ISeq
-  (as-elements [s]
-    (mapcat as-elements s))
-
-  clojure.lang.Keyword
-  (as-elements [k]
-    [(Element. k {} {} ())])
-
-  java.lang.String
-  (as-elements [s]
-    [s])
-
-  nil
-  (as-elements [_] nil)
-
-  java.lang.Object
-  (as-elements [o]
-    [(str o)]))
 
 (defn sexps-as-fragment
   "Convert a compact prxml/hiccup-style data structure into the more formal
@@ -295,8 +48,8 @@
    To provide XML conversion for your own data types, extend the AsElements
    protocol to them."
   ([] nil)
-  ([sexp] (as-elements sexp))
-  ([sexp & sexps] (mapcat as-elements (cons sexp sexps))))
+  ([sexp] (syntax/as-elements sexp))
+  ([sexp & sexps] (mapcat syntax/as-elements (cons sexp sexps))))
 
 (defn sexp-as-element
   "Convert a single sexp into an Element"
@@ -308,103 +61,9 @@
         "Cannot have multiple root elements; try creating a fragment instead")))
     root))
 
-
-(defn- attr-prefix [^XMLStreamReader sreader index]
-  (let [p (.getAttributePrefix sreader index)]
-    (when-not (str/blank? p)
-      p)))
-
-(defn- attr-hash [^XMLStreamReader sreader] (into {}
-    (for [i (range (.getAttributeCount sreader))]
-      [(keyword (attr-prefix sreader i) (.getAttributeLocalName sreader i))
-       (.getAttributeValue sreader i)])))
-
-(defn- namespaces [^XMLStreamReader sreader stack]
-  (into {}
-        (keep
-          (fn [i]
-            (let [prefix (.getNamespacePrefix sreader i)
-                  uri (.getNamespaceURI sreader i)]
-              (if prefix
-                [(keyword prefix) uri]
-                (if (not= uri (peek-namespace stack :xmlns))
-                  [:xmlns uri]))))
-          (range (.getNamespaceCount sreader)))))
-
-(defn- element-keyword [^XMLStreamReader sreader]
-  (let [prefix (.getPrefix sreader)]
-    (keyword (when-not (str/blank? prefix) prefix) (.getLocalName sreader))))
-
-; Note, sreader is mutable and mutated here in pull-seq, but it's
-; protected by a lazy-seq so it's thread-safe.
-(defn- pull-seq
-  "Creates a seq of events.  The XMLStreamConstants/SPACE clause below doesn't seem to 
-   be triggered by the JDK StAX parser, but is by others.  Leaving in to be more complete."
-  [^XMLStreamReader sreader stack]
-  (lazy-seq
-    (loop []
-      (condp == (.next sreader)
-        XMLStreamConstants/START_ELEMENT
-        (let [element-ns (namespaces sreader stack)
-              ev (event :start-element
-                        (element-keyword sreader)
-                        (attr-hash sreader)
-                        (clean-namespace element-ns)
-                        nil)
-              loaded-stack (push-namespace stack element-ns)
-              current-namespaces (peek-namespace loaded-stack)
-              [remaining final-stack] (pull-seq sreader loaded-stack)]
-          [(cons (with-meta ev current-namespaces) remaining) final-stack])
-        XMLStreamConstants/END_ELEMENT
-        (let [unwound-stack (pop-namespace stack)
-              element-name (element-keyword sreader)
-              [remaining final-stack] (pull-seq sreader unwound-stack)]
-          [(cons (event :end-element element-name nil nil nil)
-                 remaining)
-           final-stack])
-        XMLStreamConstants/CHARACTERS
-        (if-let [text (and (not (.isWhiteSpace sreader))
-                           (.getText sreader))]
-          (let [[remaining final-stack] (pull-seq sreader stack)]
-            [(cons (event :characters nil nil nil text) remaining)
-             final-stack])
-          (recur))
-        XMLStreamConstants/END_DOCUMENT
-        nil
-        (recur);; Consume and ignore comments, spaces, processing instructions etc
-        ))))
-
-(def ^{:private true} xml-input-factory-props
-  {:allocator javax.xml.stream.XMLInputFactory/ALLOCATOR
-   :coalescing javax.xml.stream.XMLInputFactory/IS_COALESCING
-   :namespace-aware javax.xml.stream.XMLInputFactory/IS_NAMESPACE_AWARE
-   :replacing-entity-references javax.xml.stream.XMLInputFactory/IS_REPLACING_ENTITY_REFERENCES
-   :supporting-external-entities javax.xml.stream.XMLInputFactory/IS_SUPPORTING_EXTERNAL_ENTITIES
-   :validating javax.xml.stream.XMLInputFactory/IS_VALIDATING
-   :reporter javax.xml.stream.XMLInputFactory/REPORTER
-   :resolver javax.xml.stream.XMLInputFactory/RESOLVER
-   :support-dtd javax.xml.stream.XMLInputFactory/SUPPORT_DTD})
-
-(defn- new-xml-input-factory [props]
-  (let [fac (javax.xml.stream.XMLInputFactory/newInstance)]
-    (doseq [[k v] props
-            :let [prop (xml-input-factory-props k)]]
-      (.setProperty fac prop v))
-    fac))
-
-(defn source-seq
-  "Parses the XML InputSource source using a pull-parser. Returns
-   a lazy sequence of Event records.  Accepts key pairs
-   with XMLInputFactory options, see http://docs.oracle.com/javase/6/docs/api/javax/xml/stream/XMLInputFactory.html
-   and xml-input-factory-props for more information. Defaults coalescing true."
-  [s & {:as props}]
-  (let [fac (new-xml-input-factory (merge {:coalescing true} props))
-        ;; Reflection on following line cannot be eliminated via a
-        ;; type hint, because s is advertised by fn parse to be an
-        ;; InputStream or Reader, and there are different
-        ;; createXMLStreamReader signatures for each of those types.
-        sreader (.createXMLStreamReader fac s)]
-    (first (pull-seq sreader empty-stack))))
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;; XML Parsing
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (defn parse
   "Parses the source, which can be an
@@ -412,14 +71,14 @@
    with XMLInputFactory options, see http://docs.oracle.com/javase/6/docs/api/javax/xml/stream/XMLInputFactory.html
    and xml-input-factory-props for more information. Defaults coalescing true."
   [source & props]
-  (event-tree (apply source-seq source props)))
+  (parse/event-tree (apply parse/source-seq source props)))
 
 (defn parse-str
   "Parses the passed in string to Clojure data structures.  Accepts key pairs
    with XMLInputFactory options, see http://docs.oracle.com/javase/6/docs/api/javax/xml/stream/XMLInputFactory.html
    and xml-input-factory-props for more information. Defaults coalescing true."
   [s & props]
-  (let [sr (java.io.StringReader. s)]
+  (let [sr (StringReader. s)]
     (apply parse sr props)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -444,9 +103,9 @@
       (check-stream-encoding stream (or (:encoding opts) "UTF-8")))
     
     (.writeStartDocument writer (or (:encoding opts) "UTF-8") "1.0")
-    (loop [[event & remaining] (flatten-elements [e]) stack empty-stack]
+    (loop [[event & remaining] (emit/flatten-elements [e]) stack ns/empty-stack]
       (when event
-        (recur remaining (emit-event event writer stack))))
+        (recur remaining (emit/emit-event event writer stack))))
     (.writeEndDocument writer)
     stream))
 
@@ -470,7 +129,7 @@
   [e ^java.io.Writer stream & {:as opts}]
   (let [sw (java.io.StringWriter.)
         _ (apply emit e sw (apply concat opts))
-        source (-> sw .toString java.io.StringReader. javax.xml.transform.stream.StreamSource.)
+        source (-> sw .toString StringReader. javax.xml.transform.stream.StreamSource.)
         result (javax.xml.transform.stream.StreamResult. stream)]
     (.transform (indenting-transformer) source result)))
 
