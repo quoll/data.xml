@@ -14,13 +14,13 @@
             [clojure.data.xml.parse :as parse]
             [clojure.data.xml.emit :as emit]
             [clojure.data.xml.namespaces :as ns]
-            [clojure.data.xml.syntax :as syntax])
+            [clojure.data.xml.syntax :as syntax]
+            [clojure.data.xml.resolve :as res])
   (:import [java.nio.charset Charset]
            [java.io StringReader]
            [javax.xml.namespace QName]
            [clojure.data.xml.event Event]
            [clojure.data.xml.node Element CData Comment]))
-
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;;; SEXP structures
@@ -145,21 +145,6 @@
 ;;;; XML Emitting
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(defn resolve-to-qname
-  "Resolves a keyword representing a QName into the fully resolved QName,
-  with the appropriate namespace."
-  [inherited-ns current-ns k]
-  (if-let [k-ns (namespace k)]
-    (let [kw-ns (keyword k-ns)
-          uri (get current-ns kw-ns (get inherited-ns kw-ns))]
-      (QName. uri (name k) k-ns))
-    (QName. (name k))))
-
-(defn resolve-attrs
-  "Resolves an attribute/value into a QName for the attribute paired with the value"
-  [inherited-ns current-ns attrs]
-  (into {} (map (fn [[k v]] [(resolve-to-qname inherited-ns current-ns k) v]) attrs)))
-
 (defprotocol Resolvable
   (resolve-xml [r] "Transforms a parsed XML node into a node that has been resolved by namespace"))
 
@@ -167,8 +152,8 @@
   Element
   (resolve-xml [{:keys [tag attrs namespaces content] :as r}]
     (let [n (meta r)]
-      (Element. (resolve-to-qname n namespaces tag)
-                (resolve-attrs n namespaces attrs)
+      (Element. (res/resolve-to-qname n namespaces tag)
+                (res/resolve-attrs n namespaces attrs)
                 namespaces
                 (map resolve-xml content))))
   Object
