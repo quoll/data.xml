@@ -11,7 +11,8 @@
   clojure.data.xml.test-parse
   (:use clojure.test
         clojure.data.xml
-        [clojure.data.xml.test-utils :only [test-stream lazy-parse*]]))
+        [clojure.data.xml.test-utils :only [test-stream lazy-parse*]])
+  (:import [javax.xml.namespace QName]))
 
 (deftest simple
   (let [input "<html><body bg=\"red\">This is <b>bold</b> test</body></html>"
@@ -79,6 +80,9 @@
     (is (= ["\nfoo bar\n\nbaz\n"] (:content (parse-str input))))
     (is (= ["\nfoo bar\n" "\nbaz\n"] (:content
                                       (parse-str input :coalescing false))))))
+
+(def rdf "http://www.w3.org/1999/02/22-rdf-syntax-ns#")
+
 (deftest test-namespace-tags
   (let [input "<rdf:RDF xmlns:data=\"http://ex.com/data#\"
                         xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">
@@ -92,7 +96,7 @@
                </rdf:RDF>"
         expected (element :rdf/RDF {}
                           {:data "http://ex.com/data#"
-                           :rdf "http://www.w3.org/1999/02/22-rdf-syntax-ns#"}
+                           :rdf rdf}
                           (element :rdf/value
                                    {:rdf/datatype "http://www.w3.org/2001/XMLSchema#integer"}
                                    {}
@@ -102,8 +106,23 @@
                                                      :data "http://example.com/more/"}
                                   (element :data/bar {} {} "bar")
                                   (element :yyy {} {} "yyy")))
-        parsed (parse-str input)]
+        parsed (parse-str input)
+        resolved (resolve-xml parsed)
+        expected-resolved (element (QName. rdf "RDF" "rdf") {}
+                                   {:data "http://ex.com/data#"
+                                    :rdf rdf}
+                                   (element (QName. rdf "value" "rdf")
+                                            {(QName. rdf "datatype" "rdf") "http://www.w3.org/2001/XMLSchema#integer"}
+                                            {}
+                                            "1")
+                                   (element (QName. "http://ex.com/data#" "foo" "data") {} {} "foo")
+                                   (element (QName. "http://example.com/more/" "subdata" "data") {}
+                                                    {:xmlns "http://foo.com/"
+                                                     :data "http://example.com/more/"}
+                                            (element (QName. "http://example.com/more/" "bar" "data") {} {} "bar")
+                                            (element (QName. "yyy") {} {} "yyy")))]
     (is (= expected parsed))
+    (is (= expected-resolved resolved))
     (let [yyy (-> parsed :content (nth 2) :content (nth 1))]
       (is (= {:xmlns "http://foo.com/"
               :data "http://example.com/more/"
