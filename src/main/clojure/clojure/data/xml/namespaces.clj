@@ -11,7 +11,9 @@
   clojure.data.xml.namespaces
   (:require [clojure.string :as str]))
 
-(def empty-stack [{}])
+(def default-xml "http://www.w3.org/XML/1998/namespace")
+
+(def empty-stack [{:xml default-xml}])
 
 (defn clean-namespace [ns]
   (into {} (remove (fn [[k v]] (str/blank? v)) ns)))

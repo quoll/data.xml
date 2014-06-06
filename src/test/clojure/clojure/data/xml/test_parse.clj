@@ -11,7 +11,8 @@
   clojure.data.xml.test-parse
   (:use clojure.test
         clojure.data.xml
-        [clojure.data.xml.test-utils :only [test-stream lazy-parse*]])
+        [clojure.data.xml.test-utils :only [test-stream lazy-parse*]]
+        [clojure.data.xml.namespaces :only [default-xml]])
   (:import [javax.xml.namespace QName]))
 
 (deftest simple
@@ -126,9 +127,11 @@
     (let [yyy (-> parsed :content (nth 2) :content (nth 1))]
       (is (= {:xmlns "http://foo.com/"
               :data "http://example.com/more/"
-              :rdf "http://www.w3.org/1999/02/22-rdf-syntax-ns#"}
+              :rdf "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+              :xml default-xml}
              (meta yyy))))
     (let [bar (-> parsed :content (nth 2) :content (nth 0))]
       (is (= {:data "http://example.com/more/"
-              :rdf "http://www.w3.org/1999/02/22-rdf-syntax-ns#"}
+              :rdf "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+              :xml default-xml}
              (meta bar))))))
